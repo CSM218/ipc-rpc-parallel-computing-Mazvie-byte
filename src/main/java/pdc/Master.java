@@ -1,5 +1,7 @@
 package pdc;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -7,7 +9,6 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * The Master acts as the Coordinator in a distributed cluster.
@@ -25,6 +26,9 @@ public class Master {
     private volatile boolean isRunning = true;
     private ServerSocket serverSocket;
     private int port;
+    // Jumbo payload support constants
+    private static final int CHUNK_SIZE = 8192; // 8KB chunks for large payload transfer
+    private static final int MAX_PAYLOAD_SIZE = 64 * 1024 * 1024; // 64MB max payload
 
     public Master() {
     }
@@ -305,13 +309,25 @@ public class Master {
         public void run() {
             try {
                 System.out.println("Handler started for " + socket.getInetAddress());
-                in = new DataInputStream(socket.getInputStream());
-                out = new DataOutputStream(socket.getOutputStream());
+                // Use BufferedStreams for efficient jumbo payload handling
+                BufferedInputStream bis = new BufferedInputStream(socket.getInputStream(), CHUNK_SIZE * 4);
+                BufferedOutputStream bos = new BufferedOutputStream(socket.getOutputStream(), CHUNK_SIZE * 4);
+                in = new DataInputStream(bis);
+                out = new DataOutputStream(bos);
 
                 while (active) {
                     int length = in.readInt();
+                    if (length < 0 || length > MAX_PAYLOAD_SIZE) {
+                        throw new IOException("Invalid payload size: " + length);
+                    }
                     byte[] data = new byte[length];
-                    in.readFully(data);
+                    // Chunked reading for jumbo payloads
+                    int offset = 0;
+                    while (offset < length) {
+                        int chunkSize = Math.min(CHUNK_SIZE, length - offset);
+                        in.readFully(data, offset, chunkSize);
+                        offset += chunkSize;
+                    }
                     Message msg = Message.unpack(data);
                     handleMessage(msg);
                 }
@@ -392,9 +408,17 @@ public class Master {
         private void sendMessage(Message msg) throws IOException {
             synchronized (socket) {
                 byte[] packed = msg.pack();
-                java.io.DataOutputStream dos = new java.io.DataOutputStream(socket.getOutputStream());
+                // Use BufferedOutputStream for efficient jumbo payload writing
+                BufferedOutputStream bos = new BufferedOutputStream(socket.getOutputStream(), CHUNK_SIZE * 4);
+                DataOutputStream dos = new DataOutputStream(bos);
                 dos.writeInt(packed.length);
-                dos.write(packed);
+                // Chunked writing for jumbo payloads
+                int offset = 0;
+                while (offset < packed.length) {
+                    int chunkSize = Math.min(CHUNK_SIZE, packed.length - offset);
+                    dos.write(packed, offset, chunkSize);
+                    offset += chunkSize;
+                }
                 dos.flush();
             }
         }

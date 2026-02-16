@@ -1,13 +1,16 @@
 package pdc;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.Socket;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.*;
 
 /**
  * A Worker is a node in the cluster capable of high-concurrency computation.
@@ -19,9 +22,14 @@ public class Worker {
 
     private Socket socket;
     private volatile boolean isRunning = true;
+    // Use ForkJoinPool for efficient parallel computation
+    private final ForkJoinPool forkJoinPool = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
     private final ExecutorService computePool = Executors
             .newFixedThreadPool(Runtime.getRuntime().availableProcessors());
     private String workerId;
+    // Jumbo payload support: configurable buffer size for large payloads
+    private static final int CHUNK_SIZE = 8192; // 8KB chunks for large payload transfer
+    private static final int MAX_PAYLOAD_SIZE = 64 * 1024 * 1024; // 64MB max payload
 
     public Worker() {
         this.workerId = "WORKER-" + System.nanoTime(); // Simple ID generation
@@ -35,6 +43,9 @@ public class Worker {
         try {
             System.out.println("Connecting to master at " + masterHost + ":" + port);
             socket = new Socket(masterHost, port);
+            // Use buffered streams for jumbo payload efficiency
+            socket.setSendBufferSize(CHUNK_SIZE * 4);
+            socket.setReceiveBufferSize(CHUNK_SIZE * 4);
 
             // Send Registration
             sendMessage(new Message("REGISTER_WORKER", workerId, null));
@@ -63,11 +74,22 @@ public class Worker {
 
     private void listenLoop() {
         try {
-            DataInputStream dis = new DataInputStream(socket.getInputStream());
+            // Use BufferedInputStream for efficient jumbo payload reading
+            BufferedInputStream bis = new BufferedInputStream(socket.getInputStream(), CHUNK_SIZE * 4);
+            DataInputStream dis = new DataInputStream(bis);
             while (isRunning) {
                 int length = dis.readInt();
+                if (length < 0 || length > MAX_PAYLOAD_SIZE) {
+                    throw new IOException("Invalid payload size: " + length);
+                }
                 byte[] data = new byte[length];
-                dis.readFully(data);
+                // Chunked reading for jumbo payloads
+                int offset = 0;
+                while (offset < length) {
+                    int chunkSize = Math.min(CHUNK_SIZE, length - offset);
+                    dis.readFully(data, offset, chunkSize);
+                    offset += chunkSize;
+                }
                 Message msg = Message.unpack(data);
                 handleMessage(msg);
             }
@@ -80,24 +102,14 @@ public class Worker {
 
     private void handleMessage(Message msg) {
         if ("RPC_REQUEST".equals(msg.messageType)) {
-            // Offload to thread pool to allow concurrent heartbeats/other messages if
-            // needed
-            // But here we might want to prioritize computation
+            // Offload to thread pool to allow concurrent heartbeats/other messages
             computePool.submit(() -> processTask(msg));
         } else if ("HEARTBEAT".equals(msg.messageType)) {
             sendHeartbeat();
         } else if ("HANDSHAKE_ACK".equals(msg.messageType)) {
-            // Handshake complete, now register
+            // Advanced handshake complete, now register
             try {
-                // Advanced Handshake Start
-                sendMessage(new Message("HANDSHAKE_INIT", workerId, null));
-                // The original instruction had `listenLoop();IOException e)` here, which is a
-                // syntax error.
-                // Assuming the intent was to replace the previous `sendMessage` and keep the
-                // `try-catch` structure.
-                // If `listenLoop()` was intended to be called here, it would need to be outside
-                // this `try` block
-                // or handled differently to maintain syntactic correctness.
+                sendMessage(new Message("REGISTER_WORKER", workerId, null));
             } catch (IOException e) {
                 e.printStackTrace();
             }
@@ -129,15 +141,39 @@ public class Worker {
     private int[][] multiplyMatrices(int[][] A, int[][] B) {
         int rA = A.length;
         int cA = A[0].length;
-        int rB = B.length; // should equal cA
         int cB = B[0].length;
 
         int[][] C = new int[rA][cB];
-        for (int i = 0; i < rA; i++) {
-            for (int k = 0; k < cA; k++) {
-                if (A[i][k] != 0) { // Optimization for sparse
-                    for (int j = 0; j < cB; j++) {
-                        C[i][j] += A[i][k] * B[k][j];
+
+        // Efficient parallel multiplication using ForkJoinPool and invokeAll
+        // Each row computed as a separate task for maximum parallelism
+        List<Callable<Void>> tasks = new ArrayList<>();
+        for (int row = 0; row < rA; row++) {
+            final int r = row;
+            tasks.add(() -> {
+                for (int k = 0; k < cA; k++) {
+                    if (A[r][k] != 0) { // Sparse optimization
+                        for (int j = 0; j < cB; j++) {
+                            C[r][j] += A[r][k] * B[k][j];
+                        }
+                    }
+                }
+                return null;
+            });
+        }
+
+        try {
+            // Use invokeAll for efficient parallel execution
+            forkJoinPool.invokeAll(tasks);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            // Fallback to sequential if interrupted
+            for (int i = 0; i < rA; i++) {
+                for (int k = 0; k < cA; k++) {
+                    if (A[i][k] != 0) {
+                        for (int j = 0; j < cB; j++) {
+                            C[i][j] += A[i][k] * B[k][j];
+                        }
                     }
                 }
             }
@@ -157,9 +193,17 @@ public class Worker {
         if (socket == null || socket.isClosed())
             return;
         byte[] packed = msg.pack();
-        DataOutputStream dos = new DataOutputStream(socket.getOutputStream());
+        // Use BufferedOutputStream for efficient jumbo payload writing
+        BufferedOutputStream bos = new BufferedOutputStream(socket.getOutputStream(), CHUNK_SIZE * 4);
+        DataOutputStream dos = new DataOutputStream(bos);
         dos.writeInt(packed.length);
-        dos.write(packed);
+        // Chunked writing for jumbo payloads
+        int offset = 0;
+        while (offset < packed.length) {
+            int chunkSize = Math.min(CHUNK_SIZE, packed.length - offset);
+            dos.write(packed, offset, chunkSize);
+            offset += chunkSize;
+        }
         dos.flush();
     }
 
@@ -172,6 +216,7 @@ public class Worker {
         }
         try {
             computePool.shutdownNow();
+            forkJoinPool.shutdownNow();
         } catch (Exception e) {
         }
     }
