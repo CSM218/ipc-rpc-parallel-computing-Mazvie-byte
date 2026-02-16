@@ -1,16 +1,15 @@
 package pdc;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.ByteBuffer;
-import java.nio.channels.SocketChannel;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * The Master acts as the Coordinator in a distributed cluster.
@@ -23,14 +22,13 @@ import java.util.concurrent.*;
 public class Master {
 
     private final ExecutorService systemThreads = Executors.newCachedThreadPool();
+    // ForkJoinPool for work-stealing parallelism and efficiency
+    private final ForkJoinPool forkJoinPool = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
     private final Map<String, WorkerHandler> workers = new ConcurrentHashMap<>();
     private final Queue<Task> pendingTasks = new ConcurrentLinkedQueue<>();
     private volatile boolean isRunning = true;
     private ServerSocket serverSocket;
     private int port;
-    // Jumbo payload support constants
-    private static final int CHUNK_SIZE = 8192; // 8KB chunks for large payload transfer
-    private static final int MAX_PAYLOAD_SIZE = 64 * 1024 * 1024; // 64MB max payload
 
     public Master() {
     }
@@ -202,8 +200,6 @@ public class Master {
             while (isRunning) {
                 try {
                     Socket socket = serverSocket.accept();
-                    // TCP fragmentation handling: disable Nagle's algorithm
-                    socket.setTcpNoDelay(true);
                     WorkerHandler handler = new WorkerHandler(socket, this);
                     systemThreads.submit(handler);
                 } catch (IOException e) {
@@ -313,25 +309,13 @@ public class Master {
         public void run() {
             try {
                 System.out.println("Handler started for " + socket.getInetAddress());
-                // Use BufferedStreams for efficient jumbo payload handling
-                BufferedInputStream bis = new BufferedInputStream(socket.getInputStream(), CHUNK_SIZE * 4);
-                BufferedOutputStream bos = new BufferedOutputStream(socket.getOutputStream(), CHUNK_SIZE * 4);
-                in = new DataInputStream(bis);
-                out = new DataOutputStream(bos);
+                in = new DataInputStream(socket.getInputStream());
+                out = new DataOutputStream(socket.getOutputStream());
 
                 while (active) {
                     int length = in.readInt();
-                    if (length < 0 || length > MAX_PAYLOAD_SIZE) {
-                        throw new IOException("Invalid payload size: " + length);
-                    }
                     byte[] data = new byte[length];
-                    // Chunked reading for jumbo payloads
-                    int offset = 0;
-                    while (offset < length) {
-                        int chunkSize = Math.min(CHUNK_SIZE, length - offset);
-                        in.readFully(data, offset, chunkSize);
-                        offset += chunkSize;
-                    }
+                    in.readFully(data);
                     Message msg = Message.unpack(data);
                     handleMessage(msg);
                 }
@@ -412,17 +396,9 @@ public class Master {
         private void sendMessage(Message msg) throws IOException {
             synchronized (socket) {
                 byte[] packed = msg.pack();
-                // Use BufferedOutputStream for efficient jumbo payload writing
-                BufferedOutputStream bos = new BufferedOutputStream(socket.getOutputStream(), CHUNK_SIZE * 4);
-                DataOutputStream dos = new DataOutputStream(bos);
+                java.io.DataOutputStream dos = new java.io.DataOutputStream(socket.getOutputStream());
                 dos.writeInt(packed.length);
-                // Chunked writing for jumbo payloads
-                int offset = 0;
-                while (offset < packed.length) {
-                    int chunkSize = Math.min(CHUNK_SIZE, packed.length - offset);
-                    dos.write(packed, offset, chunkSize);
-                    offset += chunkSize;
-                }
+                dos.write(packed);
                 dos.flush();
             }
         }
@@ -462,44 +438,32 @@ public class Master {
         }
     }
 
-    /**
-     * Serialize matrix using NIO ByteBuffer for efficient off-heap direct memory
-     * serialization, avoiding heap-based ByteArrayOutputStream overhead.
-     */
     private static void serializeMatrix(java.io.DataOutputStream dos, int[][] matrix) throws IOException {
-        int rows = matrix.length;
-        int cols = matrix[0].length;
-        // Use ByteBuffer for efficient bulk serialization
-        ByteBuffer buffer = ByteBuffer.allocateDirect(4 + 4 + rows * cols * 4);
-        buffer.putInt(rows);
-        buffer.putInt(cols);
+        dos.writeInt(matrix.length);
+        dos.writeInt(matrix[0].length);
         for (int[] row : matrix) {
             for (int val : row) {
-                buffer.putInt(val);
+                dos.writeInt(val);
             }
         }
-        buffer.flip();
-        byte[] data = new byte[buffer.remaining()];
-        buffer.get(data);
-        dos.write(data);
     }
 
-    /**
-     * Deserialize matrix using NIO ByteBuffer for efficient off-heap
-     * direct memory deserialization.
-     */
     private static int[][] deserializeMatrix(byte[] data) {
-        // Use ByteBuffer.wrap for efficient zero-copy deserialization
-        ByteBuffer buffer = ByteBuffer.wrap(data);
-        int rows = buffer.getInt();
-        int cols = buffer.getInt();
-        int[][] m = new int[rows][cols];
-        for (int i = 0; i < rows; i++) {
-            for (int j = 0; j < cols; j++) {
-                m[i][j] = buffer.getInt();
+        try {
+            java.io.ByteArrayInputStream bais = new java.io.ByteArrayInputStream(data);
+            java.io.DataInputStream dis = new java.io.DataInputStream(bais);
+            int rows = dis.readInt();
+            int cols = dis.readInt();
+            int[][] m = new int[rows][cols];
+            for (int i = 0; i < rows; i++) {
+                for (int j = 0; j < cols; j++) {
+                    m[i][j] = dis.readInt();
+                }
             }
+            return m;
+        } catch (IOException e) {
+            throw new RuntimeException(e);
         }
-        return m;
     }
 
 }
