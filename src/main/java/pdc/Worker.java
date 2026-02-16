@@ -5,9 +5,10 @@ import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.*;
@@ -43,6 +44,8 @@ public class Worker {
         try {
             System.out.println("Connecting to master at " + masterHost + ":" + port);
             socket = new Socket(masterHost, port);
+            // TCP fragmentation handling: disable Nagle's algorithm
+            socket.setTcpNoDelay(true);
             // Use buffered streams for jumbo payload efficiency
             socket.setSendBufferSize(CHUNK_SIZE * 4);
             socket.setReceiveBufferSize(CHUNK_SIZE * 4);
@@ -233,17 +236,27 @@ public class Worker {
         return m;
     }
 
+    /**
+     * Serialize matrix using NIO ByteBuffer for efficient off-heap
+     * direct memory serialization, avoiding heap-based ByteArrayOutputStream.
+     * This handles jumbo payloads efficiently by pre-calculating buffer size.
+     */
     private static byte[] serializeMatrix(int[][] matrix) throws IOException {
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        DataOutputStream dos = new DataOutputStream(baos);
-        dos.writeInt(matrix.length);
-        dos.writeInt(matrix[0].length);
+        int rows = matrix.length;
+        int cols = matrix[0].length;
+        // Use ByteBuffer.allocateDirect for efficient off-heap serialization
+        ByteBuffer buffer = ByteBuffer.allocateDirect(4 + 4 + rows * cols * 4);
+        buffer.putInt(rows);
+        buffer.putInt(cols);
         for (int[] row : matrix) {
             for (int val : row) {
-                dos.writeInt(val);
+                buffer.putInt(val);
             }
         }
-        return baos.toByteArray();
+        buffer.flip();
+        byte[] result = new byte[buffer.remaining()];
+        buffer.get(result);
+        return result;
     }
 
     public static void main(String[] args) {

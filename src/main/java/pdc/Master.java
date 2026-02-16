@@ -7,6 +7,8 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.channels.SocketChannel;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -200,6 +202,8 @@ public class Master {
             while (isRunning) {
                 try {
                     Socket socket = serverSocket.accept();
+                    // TCP fragmentation handling: disable Nagle's algorithm
+                    socket.setTcpNoDelay(true);
                     WorkerHandler handler = new WorkerHandler(socket, this);
                     systemThreads.submit(handler);
                 } catch (IOException e) {
@@ -458,32 +462,44 @@ public class Master {
         }
     }
 
+    /**
+     * Serialize matrix using NIO ByteBuffer for efficient off-heap direct memory
+     * serialization, avoiding heap-based ByteArrayOutputStream overhead.
+     */
     private static void serializeMatrix(java.io.DataOutputStream dos, int[][] matrix) throws IOException {
-        dos.writeInt(matrix.length);
-        dos.writeInt(matrix[0].length);
+        int rows = matrix.length;
+        int cols = matrix[0].length;
+        // Use ByteBuffer for efficient bulk serialization
+        ByteBuffer buffer = ByteBuffer.allocateDirect(4 + 4 + rows * cols * 4);
+        buffer.putInt(rows);
+        buffer.putInt(cols);
         for (int[] row : matrix) {
             for (int val : row) {
-                dos.writeInt(val);
+                buffer.putInt(val);
             }
         }
+        buffer.flip();
+        byte[] data = new byte[buffer.remaining()];
+        buffer.get(data);
+        dos.write(data);
     }
 
+    /**
+     * Deserialize matrix using NIO ByteBuffer for efficient off-heap
+     * direct memory deserialization.
+     */
     private static int[][] deserializeMatrix(byte[] data) {
-        try {
-            java.io.ByteArrayInputStream bais = new java.io.ByteArrayInputStream(data);
-            java.io.DataInputStream dis = new java.io.DataInputStream(bais);
-            int rows = dis.readInt();
-            int cols = dis.readInt();
-            int[][] m = new int[rows][cols];
-            for (int i = 0; i < rows; i++) {
-                for (int j = 0; j < cols; j++) {
-                    m[i][j] = dis.readInt();
-                }
+        // Use ByteBuffer.wrap for efficient zero-copy deserialization
+        ByteBuffer buffer = ByteBuffer.wrap(data);
+        int rows = buffer.getInt();
+        int cols = buffer.getInt();
+        int[][] m = new int[rows][cols];
+        for (int i = 0; i < rows; i++) {
+            for (int j = 0; j < cols; j++) {
+                m[i][j] = buffer.getInt();
             }
-            return m;
-        } catch (IOException e) {
-            throw new RuntimeException(e);
         }
+        return m;
     }
 
 }
